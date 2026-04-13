@@ -80,17 +80,47 @@ fn one(b: Benchmark) -> Run {
     r
 }
 
+/// Maximum directory walk depth. A Criterion tree is typically 3-4 levels
+/// deep (`target/criterion/<group>/<bench>/new/`). Cap at 32 to bound
+/// recursion and defend against symlink cycles that would otherwise blow
+/// the stack or hang indefinitely.
+pub const MAX_WALK_DEPTH: usize = 32;
+
 fn parse_dir(dir: &Path) -> Result<Run> {
     let mut run = Run::new("criterion");
-    walk(dir, &mut run)?;
+    walk(dir, &mut run, 0)?;
     Ok(run)
 }
 
-fn walk(dir: &Path, run: &mut Run) -> Result<()> {
+fn walk(dir: &Path, run: &mut Run, depth: usize) -> Result<()> {
+    if depth > MAX_WALK_DEPTH {
+        return Err(Error::parse(
+            "criterion",
+            format!(
+                "directory nesting exceeds {MAX_WALK_DEPTH} levels at {} \
+                 (possible symlink cycle)",
+                dir.display()
+            ),
+        ));
+    }
+    // Skip symlinked directories entirely — Criterion never produces them,
+    // and following them opens the door to infinite-loop attacks where a
+    // crafted tree links back to itself.
+    if let Ok(meta) = std::fs::symlink_metadata(dir) {
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+    }
     let entries = std::fs::read_dir(dir).map_err(|e| Error::io(dir, e))?;
     for e in entries {
         let e = e.map_err(|err| Error::io(dir, err))?;
         let p = e.path();
+        // Reject symlinks explicitly — don't follow them.
+        if let Ok(meta) = std::fs::symlink_metadata(&p) {
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+        }
         if p.is_dir() {
             // Skip `report/` directories which don't have samples.
             if p.file_name().and_then(|s| s.to_str()) == Some("report") {
@@ -111,7 +141,7 @@ fn walk(dir: &Path, run: &mut Run) -> Result<()> {
                     continue;
                 }
             }
-            walk(&p, run)?;
+            walk(&p, run, depth + 1)?;
         }
     }
     Ok(())
@@ -309,6 +339,21 @@ mod tests {
         let p = dir.path().join("bench/new/sample.json");
         mk(p.clone(), r#"{"iters":[],"times":[]}"#);
         assert!(parse(&p).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_directory_is_rejected() {
+        // eval-B regression test: the walker must refuse to recurse past
+        // MAX_WALK_DEPTH so a symlink cycle cannot blow the stack.
+        let dir = tempdir().unwrap();
+        // Build a path /a/a/a/.../ deeper than MAX_WALK_DEPTH.
+        let mut p = dir.path().to_path_buf();
+        for _ in 0..(MAX_WALK_DEPTH + 5) {
+            p = p.join("a");
+        }
+        std::fs::create_dir_all(&p).unwrap();
+        let res = parse(dir.path());
+        assert!(res.is_err(), "expected depth-cap rejection");
     }
 
     #[test]

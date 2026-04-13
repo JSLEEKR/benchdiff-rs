@@ -256,8 +256,9 @@ correction = "none"
 baseline_dir = ".benchdiff/baselines"
 
 [ignore]
-# Glob-lite patterns: `*` as prefix, suffix, or both.
-patterns = ["experimental_*", "*_legacy", "*bench*"]
+# Glob-lite patterns: `*` as zero-or-more characters, anywhere in the
+# pattern — prefix, suffix, middle, or multiple.
+patterns = ["experimental_*", "*_legacy", "*bench*", "Bench*Skip"]
 
 [tolerance]
 # Per-benchmark overrides: allowed relative change for this bench only.

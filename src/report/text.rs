@@ -3,7 +3,7 @@
 use comfy_table::{presets::UTF8_FULL, ContentArrangement, Table};
 
 use crate::compare::{DiffReport, Verdict};
-use crate::report::{fmt_ns, fmt_pct};
+use crate::report::{fmt_d, fmt_ns, fmt_pct};
 
 #[must_use]
 pub fn render(report: &DiffReport) -> String {
@@ -47,11 +47,7 @@ pub fn render(report: &DiffReport) -> String {
         } else {
             format!("{:.4}", row.p_value)
         };
-        let d = if row.cohens_d.is_finite() {
-            format!("{:.2}", row.cohens_d)
-        } else {
-            "∞".to_string()
-        };
+        let d = fmt_d(row.cohens_d);
         table.add_row(vec![
             row.name.clone(),
             fmt_ns(row.baseline_mean_ns),

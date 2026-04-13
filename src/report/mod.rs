@@ -38,6 +38,12 @@ pub fn render(report: &DiffReport, out: Output) -> Result<String> {
     }
 }
 
+/// Threshold at which we treat a saturated sentinel value as "effectively
+/// infinite" for display purposes. `compare::INF_SENTINEL` is `1e300`; we
+/// pick a comfortably lower threshold so any computation producing a very
+/// large finite number also gets rendered as `∞` in human output.
+const DISPLAY_INF_THRESHOLD: f64 = 1e100;
+
 /// Format a nanosecond count with a human-friendly unit.
 #[must_use]
 pub fn fmt_ns(ns: f64) -> String {
@@ -45,6 +51,9 @@ pub fn fmt_ns(ns: f64) -> String {
         return "—".to_string();
     }
     let abs = ns.abs();
+    if abs >= DISPLAY_INF_THRESHOLD {
+        return "∞".to_string();
+    }
     if abs >= 1e9 {
         format!("{:.3} s", ns / 1e9)
     } else if abs >= 1e6 {
@@ -57,12 +66,31 @@ pub fn fmt_ns(ns: f64) -> String {
 }
 
 /// Format a relative change (`0.05` → `+5.00%`).
+///
+/// Non-finite and saturation sentinels (`>= 1e100`) both render as `∞` /
+/// `-∞` so human output stays readable even when the underlying JSON
+/// carries a large finite placeholder for "effectively infinite".
 #[must_use]
 pub fn fmt_pct(r: f64) -> String {
     if !r.is_finite() {
         return "∞".to_string();
     }
+    if r.abs() >= DISPLAY_INF_THRESHOLD {
+        return if r > 0.0 { "+∞".to_string() } else { "-∞".to_string() };
+    }
     format!("{:+.2}%", r * 100.0)
+}
+
+/// Format Cohen's d, collapsing the saturation sentinel to `∞` / `-∞`.
+#[must_use]
+pub fn fmt_d(d: f64) -> String {
+    if !d.is_finite() {
+        return "∞".to_string();
+    }
+    if d.abs() >= DISPLAY_INF_THRESHOLD {
+        return if d > 0.0 { "∞".to_string() } else { "-∞".to_string() };
+    }
+    format!("{d:.2}")
 }
 
 #[cfg(test)]
@@ -93,6 +121,27 @@ mod tests {
     #[test]
     fn fmt_pct_infinite() {
         assert_eq!(fmt_pct(f64::INFINITY), "∞");
+    }
+
+    #[test]
+    fn fmt_pct_saturation_sentinel() {
+        // eval-B: compare::INF_SENTINEL (1e300) must render as `+∞`, not
+        // as a 300-digit percentage string.
+        assert_eq!(fmt_pct(1.0e300), "+∞");
+        assert_eq!(fmt_pct(-1.0e300), "-∞");
+    }
+
+    #[test]
+    fn fmt_ns_saturation_sentinel() {
+        assert_eq!(fmt_ns(1.0e300), "∞");
+    }
+
+    #[test]
+    fn fmt_d_basic_and_infinite() {
+        assert_eq!(fmt_d(1.2345), "1.23");
+        assert_eq!(fmt_d(f64::INFINITY), "∞");
+        assert_eq!(fmt_d(1.0e300), "∞");
+        assert_eq!(fmt_d(-1.0e300), "-∞");
     }
 
     #[test]

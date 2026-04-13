@@ -204,6 +204,12 @@ fn missing_row(name: &str, v: Verdict) -> DiffRow {
     }
 }
 
+/// Finite sentinel used when a "truly infinite" relative change or effect
+/// size would otherwise be produced (e.g. zero-variance zero-mean baseline
+/// vs. non-zero current). Keeps the JSON schema strictly numeric so
+/// downstream consumers never see `null` or non-finite floats.
+pub const INF_SENTINEL: f64 = 1.0e300;
+
 fn compute_row(name: &str, a: &[f64], b: &[f64], unit: Unit, cfg: &Config) -> DiffRow {
     use crate::stats::mean;
     let mean_a = mean(a);
@@ -211,8 +217,10 @@ fn compute_row(name: &str, a: &[f64], b: &[f64], unit: Unit, cfg: &Config) -> Di
     let rel = if mean_a.abs() < f64::EPSILON {
         if mean_b.abs() < f64::EPSILON {
             0.0
+        } else if mean_b > 0.0 {
+            INF_SENTINEL
         } else {
-            f64::INFINITY
+            -INF_SENTINEL
         }
     } else {
         (mean_b - mean_a) / mean_a
@@ -220,7 +228,18 @@ fn compute_row(name: &str, a: &[f64], b: &[f64], unit: Unit, cfg: &Config) -> Di
 
     let (p, d, verdict) = match welch_t_test(a, b) {
         Ok(r) => {
-            let d = cohens_d(a, b);
+            // Cap Cohen's d at a large finite sentinel so JSON output stays
+            // strictly numeric. A pooled SD of 0 with distinct means really
+            // does mean "infinite effect size", but downstream tools usually
+            // prefer a big number to `null`.
+            let d_raw = cohens_d(a, b);
+            let d = if d_raw.is_finite() {
+                d_raw
+            } else if d_raw > 0.0 {
+                INF_SENTINEL
+            } else {
+                -INF_SENTINEL
+            };
             let significant = r.p < cfg.alpha;
             let tol = cfg
                 .tolerance_for(name)
@@ -317,6 +336,36 @@ mod tests {
         let cfg = Config::default();
         let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
         assert_eq!(rep.rows[0].verdict, Verdict::Regression);
+    }
+
+    #[test]
+    fn ops_small_drop_fires_regression() {
+        // eval-B adversarial: baseline throughput [100,110], current [90,100].
+        // With Unit::Ops and default 5% threshold, this should fire as a
+        // Regression. The pre-eval-A bug would have classified it as an
+        // Improvement (higher-is-better inverted). We need n>=2 for Welch;
+        // pad out to stabilize the t-test.
+        let a = run_unit(
+            vec![(
+                "throughput",
+                vec![100.0, 110.0, 105.0, 102.0, 108.0, 104.0, 106.0, 103.0],
+            )],
+            Unit::Ops,
+        );
+        let b = run_unit(
+            vec![(
+                "throughput",
+                vec![90.0, 100.0, 95.0, 92.0, 98.0, 94.0, 96.0, 93.0],
+            )],
+            Unit::Ops,
+        );
+        let cfg = Config::default();
+        let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
+        assert_eq!(
+            rep.rows[0].verdict,
+            Verdict::Regression,
+            "throughput drop must be a Regression for Unit::Ops"
+        );
     }
 
     #[test]
@@ -469,12 +518,30 @@ mod tests {
     }
 
     #[test]
-    fn zero_baseline_mean_infinite_rel() {
+    fn zero_baseline_mean_saturates_to_sentinel() {
+        // eval-B regression test: previously produced `f64::INFINITY` which
+        // serialized to `null` in JSON. Now saturated to a large finite
+        // sentinel so the schema stays strictly numeric.
         let a = run(vec![("foo", vec![0.0, 0.0, 0.0, 0.0, 0.0])]);
         let b = run(vec![("foo", vec![1.0, 1.0, 1.0, 1.0, 1.0])]);
         let cfg = Config::default();
         let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
-        assert!(rep.rows[0].rel_change.is_infinite());
+        assert!(rep.rows[0].rel_change.is_finite());
+        assert!(rep.rows[0].rel_change >= 1.0e299);
+        assert!(rep.rows[0].cohens_d.is_finite());
+    }
+
+    #[test]
+    fn json_output_has_no_null_numerics_when_infinite() {
+        // eval-B regression test: serializing to JSON must not produce `null`
+        // for `rel_change` or `cohens_d` when the underlying computation would
+        // otherwise be infinite.
+        let a = run(vec![("foo", vec![0.0, 0.0, 0.0, 0.0, 0.0])]);
+        let b = run(vec![("foo", vec![1.0, 1.0, 1.0, 1.0, 1.0])]);
+        let cfg = Config::default();
+        let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
+        let json = serde_json::to_string(&rep).unwrap();
+        assert!(!json.contains("null"), "JSON leaked null: {json}");
     }
 
     #[test]

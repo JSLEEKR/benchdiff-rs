@@ -103,6 +103,22 @@ impl Config {
                 self.correction
             )));
         }
+        // eval-B: because `tolerance` is a toml::Table, `deny_unknown_fields`
+        // never reaches inside it. Validate every entry explicitly — a
+        // mistyped number (e.g. `"parse_foo" = "0.2"` — a string) would
+        // otherwise fall through `as_float()` and be silently ignored at
+        // compare time, hiding a configuration bug.
+        for (name, v) in &self.tolerance {
+            let f = v.as_float().or_else(|| v.as_integer().map(|i| i as f64));
+            match f {
+                Some(f) if f.is_finite() && f >= 0.0 => {}
+                _ => {
+                    return Err(Error::Config(format!(
+                        "tolerance.{name:?} must be a non-negative finite number, got {v:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -116,9 +132,15 @@ impl Config {
     }
 
     /// Per-benchmark tolerance override (absolute relative change).
+    ///
+    /// Accepts both TOML floats (`"bench" = 0.20`) and integers (`"bench" = 1`).
+    /// Anything else is silently ignored here — `Config::validate()` is the
+    /// canonical gate and rejects malformed entries at load time.
     #[must_use]
     pub fn tolerance_for(&self, name: &str) -> Option<f64> {
-        self.tolerance.get(name).and_then(|v| v.as_float())
+        self.tolerance
+            .get(name)
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
     }
 
     /// Starter template for `benchdiff init`.
@@ -140,24 +162,57 @@ patterns = []
     }
 }
 
-/// Tiny glob matcher: supports `*` at start, end, or both.
+/// Tiny glob matcher: supports `*` as a wildcard for zero-or-more characters.
+///
+/// Handles:
+/// - exact match                 — `foo`           → `foo`
+/// - prefix match                — `slow_*`        → `slow_encode`
+/// - suffix match                — `*_legacy`      → `parse_legacy`
+/// - contains match              — `*bench*`       → `my_bench_slow`
+/// - middle wildcard             — `Bench*Skip`    → `BenchFooSkip`
+/// - multiple wildcards          — `Bench*Foo*Bar` → `BenchXFooYBar`
+///
+/// Does NOT support `?`, character classes, or escaping — if a pattern
+/// contains a literal `*` it cannot be matched. Good enough for benchmark
+/// naming, which is our only use case.
 #[must_use]
 pub fn glob_match(pattern: &str, name: &str) -> bool {
-    match (pattern.starts_with('*'), pattern.ends_with('*')) {
-        (true, true) => {
-            let inner = &pattern[1..pattern.len() - 1];
-            name.contains(inner)
-        }
-        (true, false) => {
-            let suffix = &pattern[1..];
-            name.ends_with(suffix)
-        }
-        (false, true) => {
-            let prefix = &pattern[..pattern.len() - 1];
-            name.starts_with(prefix)
-        }
-        (false, false) => pattern == name,
+    // Split on `*`. If there are no wildcards, it's an exact match.
+    if !pattern.contains('*') {
+        return pattern == name;
     }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    // parts has at least 2 entries; first must be a prefix, last must be a
+    // suffix, and any middle parts must appear in order in the remaining
+    // string.
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
+    if !name.starts_with(first) {
+        return false;
+    }
+    if !name.ends_with(last) {
+        return false;
+    }
+    // If prefix + suffix overlap in `name` (pattern like `ab*cd` against
+    // name `abcd` → prefix `ab` + suffix `cd` both fit, middle empty), the
+    // check above is already sufficient.
+    if parts.len() == 2 {
+        return name.len() >= first.len() + last.len();
+    }
+    // Walk the remaining `name[first.len()..name.len()-last.len()]` looking
+    // for each middle chunk in order.
+    let mut cursor = first.len();
+    let end = name.len() - last.len();
+    for chunk in &parts[1..parts.len() - 1] {
+        if chunk.is_empty() {
+            continue;
+        }
+        match name[cursor..end].find(chunk) {
+            Some(idx) => cursor += idx + chunk.len(),
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -238,11 +293,64 @@ mod tests {
     }
 
     #[test]
+    fn ignore_glob_middle_wildcard() {
+        // eval-B: the pre-fix matcher treated `Bench*Skip` as a literal
+        // exact string because it had no leading or trailing `*`, so
+        // `BenchFooSkip` went unmatched and the ignore pattern silently
+        // did nothing. The README explicitly promises glob-lite matching.
+        let mut c = Config::default();
+        c.ignore.patterns.push("Bench*Skip".into());
+        assert!(c.is_ignored("BenchFooSkip"));
+        assert!(c.is_ignored("BenchBarSkip"));
+        assert!(c.is_ignored("BenchSkip"), "zero-length middle allowed");
+        assert!(!c.is_ignored("BenchFoo"));
+        assert!(!c.is_ignored("FooSkip"));
+    }
+
+    #[test]
+    fn ignore_glob_multiple_wildcards() {
+        let mut c = Config::default();
+        c.ignore.patterns.push("Bench*Foo*Bar".into());
+        assert!(c.is_ignored("BenchXFooYBar"));
+        assert!(c.is_ignored("BenchFooBar"));
+        assert!(!c.is_ignored("BenchBarFoo"));
+    }
+
+    #[test]
     fn ignore_exact() {
         let mut c = Config::default();
         c.ignore.patterns.push("exact".into());
         assert!(c.is_ignored("exact"));
         assert!(!c.is_ignored("not-exact"));
+    }
+
+    #[test]
+    fn validate_rejects_non_float_tolerance() {
+        // eval-B regression test: a tolerance entry with a string value
+        // used to silently fall through `as_float()` → None and be treated
+        // as "no override", hiding a config typo. Now we reject at load.
+        let mut c = Config::default();
+        c.tolerance
+            .insert("foo".into(), toml::Value::String("0.2".into()));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_negative_tolerance() {
+        let mut c = Config::default();
+        c.tolerance
+            .insert("foo".into(), toml::Value::Float(-0.1));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_integer_tolerance() {
+        // `"bench" = 1` is a reasonable TOML integer that should be accepted
+        // as "100%".
+        let mut c = Config::default();
+        c.tolerance.insert("foo".into(), toml::Value::Integer(1));
+        assert!(c.validate().is_ok());
+        assert_eq!(c.tolerance_for("foo"), Some(1.0));
     }
 
     #[test]

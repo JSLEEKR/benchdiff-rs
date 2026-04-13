@@ -5,6 +5,7 @@
 use clap::Parser;
 
 use benchdiff::cli::{run, Cli};
+use benchdiff::error::Error as BdError;
 
 fn main() {
     let cli = Cli::parse();
@@ -12,17 +13,40 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("benchdiff error: {err:#}");
-            let chain = format!("{err:#}");
-            let code = if chain.contains("parse") {
-                3
-            } else if chain.contains("I/O") || chain.contains("no such file") {
-                4
-            } else if chain.contains("insufficient") {
-                5
-            } else {
-                2
-            };
-            std::process::exit(code);
+            std::process::exit(classify_exit_code(&err));
         }
     }
+}
+
+/// Map an error into one of benchdiff's documented exit codes.
+///
+/// Uses the structured `benchdiff::Error` enum via `anyhow` downcasting
+/// rather than matching substrings of the `Display` output. The old
+/// substring-based approach was locale-sensitive (Windows emits translated
+/// I/O error messages) and silently misclassified anything it didn't
+/// recognize.
+fn classify_exit_code(err: &anyhow::Error) -> i32 {
+    // Walk the error chain looking for a benchdiff::Error.
+    if let Some(bd) = err.downcast_ref::<BdError>() {
+        return match bd {
+            BdError::Parse { .. }
+            | BdError::UnknownFormat
+            | BdError::Json { .. }
+            | BdError::Toml { .. }
+            | BdError::InvalidNumber { .. } => 3,
+            BdError::Io { .. }
+            | BdError::BaselineNotFound { .. }
+            | BdError::InputTooLarge { .. }
+            | BdError::LineTooLong { .. } => 4,
+            BdError::InsufficientSamples { .. }
+            | BdError::EmptyInput
+            | BdError::NonFinite { .. } => 5,
+            BdError::InvalidLabel { .. } | BdError::Config(_) => 2,
+        };
+    }
+    // Fallback: plain I/O errors surfaced without our wrapper still get 4.
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return 4;
+    }
+    2
 }
