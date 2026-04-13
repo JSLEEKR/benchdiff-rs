@@ -12,7 +12,14 @@ fn main() {
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("benchdiff error: {err:#}");
+            // Use `{err}` (not `{err:#}`) on purpose: every `benchdiff::Error`
+            // variant whose `#[from]` source is interesting (`Io`, `Json`,
+            // `Toml`) already embeds `{source}` in its `Display`. anyhow's
+            // alternate formatter walks `#[source]` and re-prints it, which
+            // would emit the same message twice (with a stray `: ` joiner).
+            // The non-alternate form prints `Display` once, which is exactly
+            // the message we want.
+            eprintln!("benchdiff error: {err}");
             std::process::exit(classify_exit_code(&err));
         }
     }
