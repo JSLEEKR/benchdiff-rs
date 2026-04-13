@@ -43,9 +43,16 @@ pub fn render(report: &DiffReport) -> String {
             format!("{:.4}", row.p_value)
         };
         let d = fmt_d(row.cohens_d);
+        // Render the benchmark name as inline code with a fence long enough
+        // to survive any embedded backticks. CommonMark says "A backslash
+        // escape ... does not work in code spans" — so the previous
+        // `\`-escape produced a broken code span and a stray closing
+        // backtick. The robust trick: pick a fence of N+1 backticks where
+        // N is the longest backtick run in the name, and pad with spaces.
+        let name_cell = render_name_cell(&row.name);
         out.push_str(&format!(
-            "| {emoji} | `{}` | {} | {} | {} | {} | {} | {} |\n",
-            escape_md(&row.name),
+            "| {emoji} | {} | {} | {} | {} | {} | {} | {} |\n",
+            name_cell,
             fmt_ns(row.baseline_mean_ns),
             fmt_ns(row.current_mean_ns),
             fmt_pct(row.rel_change),
@@ -60,8 +67,73 @@ pub fn render(report: &DiffReport) -> String {
     out
 }
 
-fn escape_md(s: &str) -> String {
-    s.replace('|', "\\|").replace('`', "\\`")
+/// Format a benchmark name as a Markdown table cell.
+///
+/// Benchmark names can legitimately contain characters that would corrupt a
+/// pipe table:
+///
+/// - `|` would split a cell.
+/// - `` ` `` would corrupt an inline code span (CommonMark forbids backslash
+///   escaping inside code spans).
+/// - `\n` / `\r` would break the row entirely (hyperfine commands can be
+///   multi-line shell strings).
+///
+/// We render the name as inline code wrapped in a backtick fence longer than
+/// any embedded backtick run, with single-space padding (CommonMark trims
+/// exactly one leading/trailing space from a code span when both ends are
+/// padded). Newlines are pre-replaced with literal `\n`/`\r` so the row stays
+/// on one line. Pipes are escaped with a leading backslash.
+#[must_use]
+fn render_name_cell(name: &str) -> String {
+    // Step 1: flatten newlines so the row never breaks. Use an escaped
+    // sequence the user can recognize. Do this BEFORE counting backticks
+    // because the original string is multi-line.
+    let flat: String = name
+        .chars()
+        .map(|c| match c {
+            '\n' => '↵',
+            '\r' => ' ',
+            other => other,
+        })
+        .collect();
+
+    // Step 2: escape pipes. Outside a code span, `\|` works fine in GFM
+    // tables. Inside the code span we'll handle them differently.
+    // We still keep the name inside a code span for typographic consistency
+    // when it has no backticks; otherwise we drop the code span and escape
+    // the pipes with backslashes.
+    if !flat.contains('`') {
+        let escaped = flat.replace('|', "\\|");
+        return format!("`{escaped}`");
+    }
+
+    // Step 3: pick a fence longer than any embedded backtick run.
+    let max_run = longest_backtick_run(&flat);
+    let fence: String = std::iter::repeat('`').take(max_run + 1).collect();
+    // Pad with single spaces so the fence and the content are unambiguous
+    // even if the content starts/ends with a backtick. Pipes inside the
+    // code span cannot be backslash-escaped (same reason as backticks),
+    // so we replace them with `\u{2758}` (LIGHT VERTICAL BAR) which renders
+    // visually identically and does NOT split the table cell.
+    let inside = flat.replace('|', "\u{2758}");
+    format!("{fence} {inside} {fence}")
+}
+
+/// Length of the longest run of consecutive backticks in `s`.
+fn longest_backtick_run(s: &str) -> usize {
+    let mut max = 0usize;
+    let mut cur = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            if cur > max {
+                max = cur;
+            }
+        } else {
+            cur = 0;
+        }
+    }
+    max
 }
 
 #[cfg(test)]
@@ -120,7 +192,86 @@ mod tests {
     fn escapes_pipes_in_name() {
         let r = rep(vec![row("foo|bar", Verdict::Unchanged, 0.0)]);
         let s = render(&r);
-        assert!(s.contains("foo\\|bar"));
+        // No-backtick path: backslash-escaped pipe inside an inline code span.
+        assert!(s.contains("`foo\\|bar`"));
+    }
+
+    #[test]
+    fn name_with_backtick_uses_longer_fence() {
+        // eval-D regression test: the previous implementation tried to
+        // backslash-escape the backtick, which CommonMark explicitly does
+        // not honour inside a code span. The result was a corrupted row
+        // with a stray closing backtick. The fix is to widen the fence.
+        let r = rep(vec![row("a`b", Verdict::Unchanged, 0.0)]);
+        let s = render(&r);
+        // Must contain the name surrounded by a double-backtick fence
+        // (one backtick in the name → fence length 2).
+        assert!(
+            s.contains("`` a`b ``"),
+            "expected widened fence around name, got:\n{s}"
+        );
+        // Crucially: the table row must not be broken across multiple lines.
+        let row_lines: Vec<&str> = s.lines().filter(|l| l.contains("a`b")).collect();
+        assert_eq!(
+            row_lines.len(),
+            1,
+            "name with backtick split the row into multiple lines"
+        );
+    }
+
+    #[test]
+    fn name_with_double_backtick_uses_triple_fence() {
+        let r = rep(vec![row("x``y", Verdict::Unchanged, 0.0)]);
+        let s = render(&r);
+        assert!(
+            s.contains("``` x``y ```"),
+            "expected triple-backtick fence, got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn name_with_newline_stays_on_one_row() {
+        // eval-D regression test: hyperfine commands can contain literal
+        // newlines (multi-line shell strings). The pre-fix renderer let
+        // them straight into the markdown table, which broke the row.
+        let r = rep(vec![row("line1\nline2", Verdict::Unchanged, 0.0)]);
+        let s = render(&r);
+        // Should be exactly one table row mentioning the (transformed) name.
+        let row_lines: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("line1") || l.contains("line2"))
+            .collect();
+        assert_eq!(
+            row_lines.len(),
+            1,
+            "newline in name split the row, got:\n{s}"
+        );
+        // The transformation symbol ↵ must appear so the original newline
+        // is still visible to the reader.
+        assert!(s.contains('↵'));
+    }
+
+    #[test]
+    fn name_with_pipe_inside_code_fence() {
+        // When the name contains a backtick (forcing the code-span path)
+        // AND a pipe, the pipe must be replaced with a non-table-splitting
+        // glyph because backslash escaping doesn't work inside code spans.
+        let r = rep(vec![row("a`b|c", Verdict::Unchanged, 0.0)]);
+        let s = render(&r);
+        let row_lines: Vec<&str> = s.lines().filter(|l| l.contains("a`b")).collect();
+        assert_eq!(row_lines.len(), 1, "pipe split the row inside code span");
+        // U+2758 LIGHT VERTICAL BAR replaces the literal pipe.
+        assert!(s.contains('\u{2758}'));
+    }
+
+    #[test]
+    fn longest_backtick_run_counts() {
+        assert_eq!(longest_backtick_run(""), 0);
+        assert_eq!(longest_backtick_run("foo"), 0);
+        assert_eq!(longest_backtick_run("a`b"), 1);
+        assert_eq!(longest_backtick_run("a``b"), 2);
+        assert_eq!(longest_backtick_run("`````"), 5);
+        assert_eq!(longest_backtick_run("`a`b``c"), 2);
     }
 
     #[test]
