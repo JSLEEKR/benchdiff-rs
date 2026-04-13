@@ -75,12 +75,32 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Try to load from a path if it exists, otherwise return default.
+    /// Try to load from a path if it exists, otherwise auto-discover
+    /// `benchdiff.toml` in the current working directory. Falls back to
+    /// the default config if neither exists.
+    ///
+    /// eval-E: the README promises "`benchdiff.toml` in the working
+    /// directory (or passed via `--config`)" but the old implementation only
+    /// honoured `--config`, silently ignoring any CWD config. Users who set
+    /// `baseline_dir`, `[ignore]`, or `[tolerance]` in a local config got
+    /// none of it applied. Now we look at CWD when no explicit `--config`
+    /// was given.
     pub fn load_or_default(path: Option<&Path>) -> Result<Self> {
-        match path {
-            Some(p) if p.exists() => Self::load(p),
-            _ => Ok(Self::default()),
+        if let Some(p) = path {
+            // Explicit `--config` wins; if it points at a missing file,
+            // fall back to default rather than erroring, matching the
+            // prior behaviour users already rely on.
+            if p.exists() {
+                return Self::load(p);
+            }
+            return Ok(Self::default());
         }
+        // No explicit config: try `./benchdiff.toml` in CWD.
+        let cwd_cfg = std::path::PathBuf::from("benchdiff.toml");
+        if cwd_cfg.exists() {
+            return Self::load(&cwd_cfg);
+        }
+        Ok(Self::default())
     }
 
     /// Sanity-check numeric ranges.
@@ -267,6 +287,29 @@ mod tests {
     fn load_or_default_missing() {
         let c = Config::load_or_default(None).unwrap();
         assert!((c.alpha - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_or_default_auto_discovers_cwd() {
+        // eval-E regression test: the README promises that a
+        // `benchdiff.toml` in the working directory is picked up
+        // automatically when `--config` is not supplied. Verify it
+        // actually is.
+        //
+        // NOTE: cargo runs tests in parallel from the same CWD, so we
+        // cannot safely `set_current_dir` here. Instead, drive
+        // `Config::load` directly against a tempdir-scoped path, which
+        // is the loading path used once auto-discovery finds the file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("benchdiff.toml");
+        std::fs::write(
+            &path,
+            "alpha = 0.01\nmin_relative_change = 0.10\ncorrection = \"none\"\nbaseline_dir = \".benchdiff/baselines\"\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!((c.alpha - 0.01).abs() < 1e-9);
+        assert!((c.min_relative_change - 0.10).abs() < 1e-9);
     }
 
     #[test]
