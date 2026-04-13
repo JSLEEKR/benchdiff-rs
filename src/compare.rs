@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::sample::Run;
+use crate::sample::{Run, Unit};
 use crate::stats::{benjamini_hochberg, cohens_d, welch_t_test};
 
 /// Per-benchmark verdict.
@@ -117,7 +117,12 @@ pub fn compare_runs(
             Some(cb) => {
                 let a = bb.samples_normalized();
                 let b = cb.samples_normalized();
-                let row = compute_row(&bb.name, &a, &b, cfg);
+                // Use baseline's unit as authoritative. If current's unit is
+                // different (e.g. ns vs us), samples_normalized has already
+                // converted time units to ns-equivalents. For non-time units
+                // (ops/bytes) the passthrough means "same unit implies same
+                // semantic" which is the user's responsibility.
+                let row = compute_row(&bb.name, &a, &b, bb.unit, cfg);
                 if matches!(row.verdict, Verdict::Regression | Verdict::Improvement | Verdict::Unchanged)
                 {
                     p_indices.push(rows.len());
@@ -199,7 +204,7 @@ fn missing_row(name: &str, v: Verdict) -> DiffRow {
     }
 }
 
-fn compute_row(name: &str, a: &[f64], b: &[f64], cfg: &Config) -> DiffRow {
+fn compute_row(name: &str, a: &[f64], b: &[f64], unit: Unit, cfg: &Config) -> DiffRow {
     use crate::stats::mean;
     let mean_a = mean(a);
     let mean_b = mean(b);
@@ -222,7 +227,14 @@ fn compute_row(name: &str, a: &[f64], b: &[f64], cfg: &Config) -> DiffRow {
                 .unwrap_or(cfg.min_relative_change);
             let big_enough = rel.abs() >= tol;
             let verdict = if significant && big_enough {
-                if mean_b > mean_a {
+                // For time/bytes units, larger = worse (Regression).
+                // For throughput (Ops), larger = better (Improvement).
+                let b_is_worse = if matches!(unit, Unit::Ops) {
+                    mean_b < mean_a
+                } else {
+                    mean_b > mean_a
+                };
+                if b_is_worse {
                     Verdict::Regression
                 } else {
                     Verdict::Improvement
@@ -259,6 +271,69 @@ mod tests {
             r.benchmarks.push(Benchmark::new(n, s, Unit::Ns).unwrap());
         }
         r
+    }
+
+    fn run_unit(b: Vec<(&str, Vec<f64>)>, unit: Unit) -> Run {
+        let mut r = Run::new("t");
+        for (n, s) in b {
+            r.benchmarks.push(Benchmark::new(n, s, unit).unwrap());
+        }
+        r
+    }
+
+    #[test]
+    fn ops_increase_is_improvement_not_regression() {
+        // eval-A regression test: for Unit::Ops, higher is better, so an
+        // increase from 100 ops to 200 ops must classify as Improvement,
+        // NOT Regression (which is what the pre-fix code did — breaking CI
+        // for anyone benchmarking throughput).
+        let a = run_unit(
+            vec![("throughput", vec![100.0, 100.5, 99.5, 100.2, 99.8, 100.1])],
+            Unit::Ops,
+        );
+        let b = run_unit(
+            vec![("throughput", vec![200.0, 200.5, 199.5, 200.2, 199.8, 200.1])],
+            Unit::Ops,
+        );
+        let cfg = Config::default();
+        let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
+        assert_eq!(rep.rows[0].verdict, Verdict::Improvement);
+        assert_eq!(rep.regressions(), 0);
+        assert_eq!(rep.improvements(), 1);
+    }
+
+    #[test]
+    fn ops_decrease_is_regression() {
+        // Mirror of the previous test: throughput dropping 200→100 IS a
+        // regression for Unit::Ops.
+        let a = run_unit(
+            vec![("throughput", vec![200.0, 200.5, 199.5, 200.2, 199.8, 200.1])],
+            Unit::Ops,
+        );
+        let b = run_unit(
+            vec![("throughput", vec![100.0, 100.5, 99.5, 100.2, 99.8, 100.1])],
+            Unit::Ops,
+        );
+        let cfg = Config::default();
+        let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
+        assert_eq!(rep.rows[0].verdict, Verdict::Regression);
+    }
+
+    #[test]
+    fn bytes_increase_is_regression() {
+        // Bytes are "higher = worse" (memory), so the default direction is
+        // correct.
+        let a = run_unit(
+            vec![("alloc", vec![1000.0, 1001.0, 999.0, 1000.0, 1001.0, 999.0])],
+            Unit::Bytes,
+        );
+        let b = run_unit(
+            vec![("alloc", vec![2000.0, 2001.0, 1999.0, 2000.0, 2001.0, 1999.0])],
+            Unit::Bytes,
+        );
+        let cfg = Config::default();
+        let rep = compare_runs(&a, &b, "v1", &cfg).unwrap();
+        assert_eq!(rep.rows[0].verdict, Verdict::Regression);
     }
 
     #[test]

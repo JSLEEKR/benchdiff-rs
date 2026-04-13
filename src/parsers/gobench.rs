@@ -39,18 +39,16 @@ pub fn parse_str(text: &str) -> Result<Run> {
             continue;
         }
         if let Some((name, value, unit)) = parse_line(trimmed)? {
-            let entry = agg.entry(name).or_insert_with(|| (Vec::new(), unit));
+            if !value.is_finite() {
+                return Err(Error::NonFinite { name });
+            }
+            let entry = agg.entry(name.clone()).or_insert_with(|| (Vec::new(), unit));
             // If unit changes mid-run, reject (shouldn't happen in real output).
             if entry.1 != unit {
                 return Err(Error::parse(
                     "gobench",
-                    format!("unit changed for benchmark in same run"),
+                    format!("unit changed mid-run for benchmark {name:?}"),
                 ));
-            }
-            if !value.is_finite() {
-                return Err(Error::NonFinite {
-                    name: entry.0.iter().len().to_string(),
-                });
             }
             entry.0.push(value);
         }
@@ -241,5 +239,32 @@ ok      example.com/x    1.234s
         let t = "BenchmarkFoo-8 xx 100 ns/op\n";
         let run = parse_str(t).unwrap();
         assert_eq!(run.benchmarks.len(), 0);
+    }
+
+    #[test]
+    fn nonfinite_error_reports_real_name() {
+        // eval-A regression test: the pre-fix code reported the length of
+        // the aggregated samples vec (as a string!) instead of the benchmark
+        // name when NaN/inf was encountered.
+        let t = "BenchmarkFoo-8 1000 NaN ns/op\n";
+        let err = parse_str(t).unwrap_err();
+        match err {
+            Error::NonFinite { name } => {
+                assert_eq!(name, "BenchmarkFoo");
+            }
+            other => panic!("expected NonFinite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonfinite_inf_reports_real_name() {
+        let t = "BenchmarkBar-8 1000 inf ns/op\n";
+        let err = parse_str(t).unwrap_err();
+        match err {
+            Error::NonFinite { name } => {
+                assert_eq!(name, "BenchmarkBar");
+            }
+            other => panic!("expected NonFinite, got {other:?}"),
+        }
     }
 }
