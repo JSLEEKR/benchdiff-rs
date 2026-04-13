@@ -1,0 +1,39 @@
+[package]
+name = "benchdiff"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["JSLEEKR <93jslee@gmail.com>"]
+description = "Statistical benchmark regression detector for Criterion, Go bench, and hyperfine"
+license = "MIT"
+repository = "https://github.com/JSLEEKR/benchdiff-rs"
+homepage = "https://github.com/JSLEEKR/benchdiff-rs"
+readme = "README.md"
+keywords = ["benchmark", "regression", "criterion", "hyperfine", "statistics"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+
+[lib]
+name = "benchdiff"
+path = "src/lib.rs"
+
+[[bin]]
+name = "benchdiff"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+anyhow = "1.0"
+comfy-table = "7.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3

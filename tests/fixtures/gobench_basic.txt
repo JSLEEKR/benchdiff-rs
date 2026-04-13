@@ -1,0 +1,18 @@
+goos: linux
+goarch: amd64
+pkg: example.com/bench
+cpu: Intel(R) Xeon(R) CPU @ 2.20GHz
+BenchmarkFastPath-8          	 1000000	      1043 ns/op	     256 B/op	       3 allocs/op
+BenchmarkFastPath-8          	 1000000	      1051 ns/op	     256 B/op	       3 allocs/op
+BenchmarkFastPath-8          	 1000000	      1038 ns/op	     256 B/op	       3 allocs/op
+BenchmarkSlowPath-8          	  100000	     13240 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkSlowPath-8          	  100000	     13180 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkSlowPath-8          	  100000	     13310 ns/op	    1024 B/op	      12 allocs/op
+BenchmarkEncodeJSON/small-8  	  500000	      2410 ns/op	     512 B/op	       5 allocs/op
+BenchmarkEncodeJSON/small-8  	  500000	      2402 ns/op	     512 B/op	       5 allocs/op
+BenchmarkEncodeJSON/small-8  	  500000	      2418 ns/op	     512 B/op	       5 allocs/op
+BenchmarkEncodeJSON/large-8  	   50000	     28710 ns/op	   16384 B/op	      20 allocs/op
+BenchmarkEncodeJSON/large-8  	   50000	     28650 ns/op	   16384 B/op	      20 allocs/op
+BenchmarkEncodeJSON/large-8  	   50000	     28770 ns/op	   16384 B/op	      20 allocs/op
+PASS
+ok  	example.com/bench	9.876s
